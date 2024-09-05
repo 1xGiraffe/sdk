@@ -45,7 +45,7 @@ import {
   bifrost,
   centrifuge,
   crust,
-  hydraDX,
+  hydration,
   interlay,
   polkadot,
   kilt_chain,
@@ -1072,7 +1072,7 @@ const toEthereumViaWormhole: AssetConfig[] = [
   }),
 ];
 
-export const hydraDxConfig = new ChainConfig({
+export const hydrationConfig = new ChainConfig({
   assets: [
     ...toAcala,
     ...toAcalaViaWormhole,
@@ -1096,5 +1096,5 @@ export const hydraDxConfig = new ChainConfig({
     ...toUnique,
     ...toZeitgeist,
   ],
-  chain: hydraDX,
+  chain: hydration,
 });
