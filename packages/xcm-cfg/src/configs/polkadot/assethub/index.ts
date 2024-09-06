@@ -1,14 +1,19 @@
 import { AssetConfig, ChainConfig } from '@galacticcouncil/xcm-core';
 
-import { ded, dot, dota, pink, usdc, usdt } from '../../assets';
-import { assetHub, bifrost, hydration, moonbeam, polkadot } from '../../chains';
+import { ded, dot, dota, pink, usdc, usdt } from '../../../assets';
+import {
+  assetHub,
+  bifrost,
+  hydration,
+  moonbeam,
+  polkadot,
+} from '../../../chains';
 import {
   AssetMinBuilder,
   BalanceBuilder,
   ExtrinsicBuilder,
-} from '../../builders';
-
-const xcmDeliveryFeeAmount = 0.036;
+} from '../../../builders';
+import { toHydrationExtTemplate, xcmDeliveryFeeAmount } from './templates';
 
 const toHydration: AssetConfig[] = [
   new AssetConfig({
@@ -77,46 +82,8 @@ const toHydration: AssetConfig[] = [
     },
     min: AssetMinBuilder().assets().asset(),
   }),
-  new AssetConfig({
-    asset: ded,
-    balance: BalanceBuilder().substrate().assets().account(),
-    destination: hydration,
-    destinationFee: {
-      amount: 0.02,
-      asset: usdt,
-      balance: BalanceBuilder().substrate().assets().account(),
-    },
-    extrinsic: ExtrinsicBuilder()
-      .polkadotXcm()
-      .limitedReserveTransferAssets()
-      .X2(),
-    fee: {
-      asset: dot,
-      balance: BalanceBuilder().substrate().system().account(),
-      xcmDeliveryFeeAmount,
-    },
-    min: AssetMinBuilder().assets().asset(),
-  }),
-  new AssetConfig({
-    asset: dota,
-    balance: BalanceBuilder().substrate().assets().account(),
-    destination: hydration,
-    destinationFee: {
-      amount: 0.02,
-      asset: usdt,
-      balance: BalanceBuilder().substrate().assets().account(),
-    },
-    extrinsic: ExtrinsicBuilder()
-      .polkadotXcm()
-      .limitedReserveTransferAssets()
-      .X2(),
-    fee: {
-      asset: dot,
-      balance: BalanceBuilder().substrate().system().account(),
-      xcmDeliveryFeeAmount,
-    },
-    min: AssetMinBuilder().assets().asset(),
-  }),
+  toHydrationExtTemplate(ded),
+  toHydrationExtTemplate(dota),
 ];
 
 const toPolkadot: AssetConfig[] = [
