@@ -36,26 +36,41 @@ export class BalanceClient extends Papi {
     super(client, at);
   }
 
-  async getBalance(account: string, assetId: number): Promise<Balance> {
+  async getBalance(
+    account: string,
+    assetId: number,
+    at: BlockAt = this.at
+  ): Promise<Balance> {
     return assetId === SYSTEM_ASSET_ID
-      ? this.getSystemBalance(account)
-      : this.getBalanceData(account, assetId);
+      ? this.getSystemBalance(account, at)
+      : this.getBalanceData(account, assetId, at);
   }
 
-  async getSystemBalance(account: string): Promise<Balance> {
+  async getSystemBalance(
+    account: string,
+    at: BlockAt = this.at
+  ): Promise<Balance> {
     const query = this.api.query.System.Account;
-    const { data } = await query.getValue(account, { at: this.at });
+    const { data } = await query.getValue(account, { at });
     return this.getBreakdown(data);
   }
 
-  async getTokenBalance(account: string, assetId: number): Promise<Balance> {
+  async getTokenBalance(
+    account: string,
+    assetId: number,
+    at: BlockAt = this.at
+  ): Promise<Balance> {
     const query = this.api.query.Tokens.Accounts;
-    const data = await query.getValue(account, assetId, { at: this.at });
+    const data = await query.getValue(account, assetId, { at });
     return this.getBreakdown(data);
   }
 
-  async getErc20Balance(account: string, assetId: number): Promise<Balance> {
-    return this.getBalanceData(account, assetId);
+  async getErc20Balance(
+    account: string,
+    assetId: number,
+    at: BlockAt = this.at
+  ): Promise<Balance> {
+    return this.getBalanceData(account, assetId, at);
   }
 
   watchBalance(address: string): Observable<AssetBalance[]> {
@@ -230,10 +245,11 @@ export class BalanceClient extends Papi {
 
   private async getBalanceData(
     account: string,
-    assetId: number
+    assetId: number,
+    at: BlockAt = this.at
   ): Promise<Balance> {
     const data = await this.api.apis.CurrenciesApi.account(assetId, account, {
-      at: this.at,
+      at,
     });
     return this.getBreakdown(data);
   }

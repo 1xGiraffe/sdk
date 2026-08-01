@@ -1,6 +1,7 @@
 import {
   AccountId,
   Binary,
+  BlockInfo,
   CompatibilityLevel,
   Enum,
   SizedHex,
@@ -8,10 +9,18 @@ import {
 import { toHex } from '@polkadot-api/utils';
 
 import {
+  Observable,
   Subscription,
+  bufferTime,
+  concatMap,
   distinctUntilChanged,
+  filter,
   finalize,
+  from,
   map,
+  merge,
+  pairwise,
+  switchMap,
   tap,
 } from 'rxjs';
 
@@ -20,6 +29,8 @@ import { HYDRATION_SS58_PREFIX } from '@galacticcouncil/common';
 import { PoolClient } from '../PoolClient';
 import { PoolType, PoolLimits, PoolToken, PoolPair } from '../types';
 
+import { SYSTEM_ASSET_ID } from '../../consts';
+import { AssetBalance } from '../../types';
 import { fmt, QueryBus } from '../../utils';
 
 import { OmniPoolBase, OmniPoolFees, OmniPoolToken } from './OmniPool';
@@ -39,9 +50,17 @@ const { FeeUtils } = fmt;
 const ORACLE_NAME = Binary.toHex(Binary.fromText('omnipool')) as SizedHex<8>;
 const ORACLE_PERIOD = Enum('Short');
 
+interface PoolStateEvent {
+  block: BlockInfo;
+  ids: number[];
+}
+
 export class OmniPoolClient extends PoolClient<OmniPoolBase> {
   private queryBus = new QueryBus();
   private block: number = 0;
+
+  private poolStateSyncId = 0;
+  private poolStateAppliedBlockByAsset = new Map<number, number>();
 
   private dynamicFeesConfig = this.queryBus.scope<
     [number],
@@ -320,53 +339,264 @@ export class OmniPoolClient extends PoolClient<OmniPoolBase> {
       });
   }
 
-  private subscribeAssets(): Subscription {
+  /**
+   * Balance updates are folded into the block-consistent pool state sync
+   * (`subscribePoolState`), so the base-class balance writer must stay off —
+   * it applies balances without any block coordination.
+   */
+  protected subscribeBalances(): Subscription {
+    return Subscription.EMPTY;
+  }
+
+  private watchOmnipoolAssets(): Observable<PoolStateEvent> {
     return this.api.query.Omnipool.Assets.watchEntries({
       at: 'best',
-    })
+    }).pipe(
+      distinctUntilChanged((_, current) => !current.deltas),
+      map((value, index) => ({ value, index })),
+      tap(({ value, index }) => {
+        if (index > 0) {
+          this.log.trace('omnipool.Assets', value.deltas?.upserted);
+        }
+      }),
+      this.watchGuard('omnipool.Assets'),
+      map(({ value: { block, deltas } }) => ({
+        block,
+        ids: (deltas?.upserted ?? []).map(({ args }) => args[0]),
+      })),
+      filter(({ ids }) => ids.length > 0)
+    );
+  }
+
+  private watchTokenBalances(pool: OmniPoolBase): Observable<PoolStateEvent> {
+    return this.api.query.Tokens.Accounts.watchEntries(pool.address, {
+      at: 'best',
+    }).pipe(
+      distinctUntilChanged((_, current) => !current.deltas),
+      map(({ block, deltas }) => ({
+        block,
+        ids: [
+          ...(deltas?.deleted ?? []).map(({ args }) => args[1]),
+          ...(deltas?.upserted ?? []).map(({ args }) => args[1]),
+        ],
+      })),
+      filter(({ ids }) => ids.length > 0)
+    );
+  }
+
+  private watchSystemBalance(pool: OmniPoolBase): Observable<PoolStateEvent> {
+    return this.api.query.System.Account.watchValue(pool.address, {
+      at: 'best',
+    }).pipe(
+      distinctUntilChanged((prev, curr) => {
+        const p = prev.value.data;
+        const c = curr.value.data;
+        return (
+          p.free === c.free &&
+          p.reserved === c.reserved &&
+          p.frozen === c.frozen
+        );
+      }),
+      map((value, index) => ({ value, index })),
+      filter(({ index }) => index > 0),
+      map(({ value: { block } }) => ({ block, ids: [SYSTEM_ASSET_ID] }))
+    );
+  }
+
+  private watchErc20Balances(pool: OmniPoolBase): Observable<PoolStateEvent> {
+    const erc20Ids = pool.tokens
+      .filter((t) => t.type === 'Erc20')
+      .map((t) => t.id);
+
+    return this.client.bestBlocks$.pipe(
+      map(([best]) => best),
+      switchMap((best) =>
+        from(this.fetchPoolBalances(pool.address, erc20Ids, best.hash)).pipe(
+          map((balances) => ({ block: best, balances }))
+        )
+      ),
+      pairwise(),
+      map(([prev, curr]) => {
+        const deltas = this.balance.getDeltas(prev.balances, curr.balances);
+        return { block: curr.block, ids: deltas.map(({ id }) => id) };
+      }),
+      filter(({ ids }) => ids.length > 0)
+    );
+  }
+
+  private watchInitialPoolState(pool: OmniPoolBase): Observable<PoolStateEvent> {
+    return from(this.client.getBestBlocks()).pipe(
+      map(([best]) => ({ block: best, ids: pool.tokens.map(({ id }) => id) }))
+    );
+  }
+
+  private subscribePoolState(): Subscription {
+    const [pool] = this.store.pools;
+    if (!pool) return Subscription.EMPTY;
+
+    const syncId = ++this.poolStateSyncId;
+    this.poolStateAppliedBlockByAsset.clear();
+
+    const sources: Observable<PoolStateEvent>[] = [
+      this.watchInitialPoolState(pool),
+      this.watchOmnipoolAssets(),
+      this.watchTokenBalances(pool),
+    ];
+
+    if (this.hasSystemAsset(pool)) {
+      sources.push(this.watchSystemBalance(pool));
+    }
+    if (this.hasErc20Asset(pool)) {
+      sources.push(this.watchErc20Balances(pool));
+    }
+
+    const sub = merge(...sources)
       .pipe(
-        distinctUntilChanged((_, current) => !current.deltas),
-        map((value, index) => ({ value, index })),
-        tap(({ value, index }) => {
-          if (index > 0) {
-            this.log.trace('omnipool.Assets', value.deltas?.upserted);
-          }
-        }),
-        this.watchGuard('omnipool.Assets')
+        bufferTime(250),
+        filter((events) => events.length > 0),
+        concatMap((events) => from(this.syncPoolState(events, syncId))),
+        this.watchGuard('omnipool.State')
       )
-      .subscribe(({ value: { deltas } }) => {
-        this.store.update(([pool]) => {
-          const changes = deltas?.upserted.reduce((acc, o) => {
-            const [key] = o.args;
-            acc.set(key, o.value);
-            return acc;
-          }, new Map<number, TOmnipoolAsset>());
+      .subscribe();
 
-          const updated = pool.tokens.map((t) => {
-            const delta = changes?.get(t.id);
-            return delta ? this.updateTokenState(t, delta) : t;
-          });
+    sub.add(() => {
+      if (this.poolStateSyncId === syncId) {
+        this.poolStateSyncId++;
+      }
+    });
 
-          return [
-            {
-              ...pool,
-              tokens: updated,
-            },
-          ];
-        });
-      });
+    return sub;
   }
 
   protected subscribeUpdates(): Subscription {
     const sub = new Subscription();
 
-    sub.add(this.subscribeAssets());
+    sub.add(this.subscribePoolState());
     sub.add(this.subscribeDynamicFees());
     sub.add(this.subscribeDynamicFeesConfig());
     sub.add(this.subscribeEmaOracles());
     sub.add(this.subscribeBlock());
 
     return sub;
+  }
+
+  private isActivePoolStateSync(syncId: number): boolean {
+    return this.poolStateSyncId === syncId;
+  }
+
+  private isStalePoolStateBlock(assetId: number, block: BlockInfo): boolean {
+    const applied = this.poolStateAppliedBlockByAsset.get(assetId);
+    return applied !== undefined && block.number < applied;
+  }
+
+  private markPoolStateBlockApplied(assetId: number, block: BlockInfo): void {
+    this.poolStateAppliedBlockByAsset.set(assetId, block.number);
+  }
+
+  private async syncPoolState(
+    events: PoolStateEvent[],
+    syncId: number
+  ): Promise<void> {
+    const byBlock = new Map<string, { block: BlockInfo; ids: Set<number> }>();
+
+    events.forEach(({ block, ids }) => {
+      const group = byBlock.get(block.hash) ?? { block, ids: new Set() };
+      ids.forEach((id) => group.ids.add(id));
+      byBlock.set(block.hash, group);
+    });
+
+    const ordered = Array.from(byBlock.values()).sort(
+      (a, b) => a.block.number - b.block.number
+    );
+
+    for (const { block, ids } of ordered) {
+      if (!this.isActivePoolStateSync(syncId)) return;
+      await this.syncPoolStateAt(block, Array.from(ids), syncId);
+    }
+  }
+
+  private async syncPoolStateAt(
+    block: BlockInfo,
+    ids: number[],
+    syncId: number
+  ): Promise<void> {
+    if (!this.isActivePoolStateSync(syncId)) return;
+
+    const [pool] = this.store.pools;
+    if (!pool) return;
+
+    const known = new Set(pool.tokens.map((t) => t.id));
+    const wanted = ids.filter(
+      (id) => known.has(id) && !this.isStalePoolStateBlock(id, block)
+    );
+    if (wanted.length === 0) return;
+
+    const at = block.hash;
+    const nonHub = wanted.filter((id) => id !== pool.hubAssetId);
+
+    const [balances, states] = await Promise.all([
+      this.fetchPoolBalances(pool.address, wanted, at),
+      Promise.all(
+        nonHub.map(async (id) => {
+          const state = await this.api.query.Omnipool.Assets.getValue(id, {
+            at,
+          });
+          return [id, state] as const;
+        })
+      ),
+    ]);
+
+    if (!this.isActivePoolStateSync(syncId)) return;
+
+    const balanceByAsset = new Map(
+      balances.map(({ id, balance }) => [id, balance.transferable])
+    );
+    const stateByAsset = states.reduce((acc, [id, state]) => {
+      if (state) acc.set(id, state);
+      return acc;
+    }, new Map<number, TOmnipoolAsset>());
+
+    this.store.update(([current]) => {
+      if (!this.isActivePoolStateSync(syncId)) return [];
+      if (!current) return [];
+
+      const fresh = wanted.filter((id) => !this.isStalePoolStateBlock(id, block));
+      if (fresh.length === 0) return [];
+
+      const freshSet = new Set(fresh);
+      const applied = new Set<number>();
+
+      this.block = Math.max(this.block, block.number);
+
+      const tokens = current.tokens.map((token) => {
+        if (!freshSet.has(token.id)) return token;
+
+        const withBalance = {
+          ...token,
+          balance: balanceByAsset.get(token.id) ?? token.balance,
+        };
+        const state = stateByAsset.get(token.id);
+
+        applied.add(token.id);
+        return state ? this.updateTokenState(withBalance, state) : withBalance;
+      });
+
+      applied.forEach((id) => this.markPoolStateBlockApplied(id, block));
+      return [{ ...current, tokens }];
+    });
+  }
+
+  private async fetchPoolBalances(
+    address: string,
+    ids: number[],
+    at: string
+  ): Promise<AssetBalance[]> {
+    return await Promise.all(
+      ids.map(async (id) => ({
+        id,
+        balance: await this.balance.getBalance(address, id, at),
+      }))
+    );
   }
 
   private updateTokenState(token: PoolToken, state: TOmnipoolAsset) {
