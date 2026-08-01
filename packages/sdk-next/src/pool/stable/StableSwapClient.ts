@@ -464,7 +464,6 @@ export class StableSwapClient extends PoolClient<StableSwapBase> {
       .subscribe(async (parsed) => {
         const targets = new Set<string>();
         for (const ev of parsed) {
-          console.log(ev);
           if (ev.eventName === 'ManagedOracle.PriceUpdated') {
             const t = this.mmRouting.byEmitter.get(ev.emitter);
             if (t) targets.add(t);
